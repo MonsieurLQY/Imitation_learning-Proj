@@ -13,7 +13,7 @@ find_package(sensor_msgs REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(qpOASES REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Widgets Charts)
+# find_package(Qt6 REQUIRED COMPONENTS Widgets Charts)
 find_package(Boost REQUIRED COMPONENTS system thread atomic)
 
 add_executable(mpc_interpolation_node src/interpolation.cpp
@@ -26,30 +26,29 @@ add_executable(cubic_spline_node src/cubic_spline.cpp
 
 target_include_directories(mpc_interpolation_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
-
+  $<INSTALL_INTERFACE:include>
+  "$ENV{HOME}/.local/qpoases/include"
+)
 target_include_directories(cubic_spline_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  $<INSTALL_INTERFACE:include>
+  "$ENV{HOME}/.local/qpoases/include"
+)
   
 target_compile_features(mpc_interpolation_node PUBLIC c_std_99 cxx_std_20)
 target_compile_features(cubic_spline_node PUBLIC c_std_99 cxx_std_20)
 
-target_link_libraries(mpc_interpolation_node 
-    qpOASES
-    Eigen3::Eigen
-    # Qt6::Widgets
-    # Qt6::Charts
-    Boost::system 
-    Boost::thread 
-    Boost::atomic
+target_link_libraries(mpc_interpolation_node
+  "$ENV{HOME}/.local/qpoases/lib/libqpOASES.so"
+  Eigen3::Eigen
+  Boost::system
+  Boost::thread
+  Boost::atomic
 )
 
 target_link_libraries(cubic_spline_node
-    qpOASES
-    Eigen3::Eigen
-    # Qt6::Widgets
-    # Qt6::Charts
+  "$ENV{HOME}/.local/qpoases/lib/libqpOASES.so"
+  Eigen3::Eigen
 )
 
 ament_target_dependencies(mpc_interpolation_node
