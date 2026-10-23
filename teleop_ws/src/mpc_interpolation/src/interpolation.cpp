@@ -19,9 +19,25 @@
 #include "mpc_interpolation/mpc_spline.hpp"
 #include "mpc_interpolation/cubic_spline.hpp"
 
+/*
+ * MPC 关节轨迹插值节点
+ * ===================
+ *
+ * 教学主链路：
+ *   /rokae_control_joints（IK 给出的 7 个低频目标关节角）
+ *       -> update_ref_points()：接收并低通滤波
+ *       -> exec_planning()：在相邻目标间生成参考点
+ *       -> mpcTrajCompute()：考虑位置、速度、加速度等约束进行平滑
+ *       -> mimicSendGoal()：以 1000 Hz 发布 7 个关节命令
+ *       -> /sent_joints
+ *
+ * 这里的三个工作线程通过无锁队列串联。理解数据方向和各线程频率比一开始
+ * 深究 MPC 数学推导更重要；权重来自 config/mpc_weight.yaml。
+ */
 
 constexpr int jointSize = 7;
-constexpr double mpc_dt = 0.001; // 1000Hz
+constexpr double mpc_dt = 0.001; // MPC 离散时间 1 ms，对应 1000 Hz
+// 启动闸门：先积累参考点/MPC 输出，避免下游线程一启动就读到空队列。
 constexpr uint32_t MPC_START_REF = 40;
 constexpr uint32_t MIMIC_START_MPC_NUM = 10;
 // constexpr size_t MPC_BUFFER_CAP = 16;
@@ -33,6 +49,7 @@ using namespace std::chrono_literals;
 
 bool setRealtimePriority(pthread_t thread, int priority)
 {
+    // 尝试使用 Linux SCHED_FIFO 实时调度；权限不足时只报错，不终止节点。
     sched_param sch_params;
     sch_params.sched_priority = priority;
 
@@ -46,6 +63,7 @@ bool setRealtimePriority(pthread_t thread, int priority)
 
 bool setThreadAffinity(pthread_t thread, int cpu_core_id)
 {
+    // 把高频线程固定到指定 CPU 核，减少调度迁移带来的时间抖动。
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_core_id, &cpuset);
@@ -68,15 +86,19 @@ public:
         // Initialize the node
         RCLCPP_INFO(this->get_logger(), "Interpolation node started.");
 
+        // 主链路只关心最新的实时目标，因此历史深度为 1。
         auto qos = rclcpp::QoS(rclcpp::KeepLast(1))
             .reliability(rclcpp::ReliabilityPolicy::Reliable)
             .durability(rclcpp::DurabilityPolicy::Volatile)
             .deadline(rclcpp::Duration(1ms));
 
+        // 上游 arm_tele_real 的输出；每条消息预期恰好包含 7 个关节角。
         roake_control_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             "/rokae_control_joints", qos, std::bind(&interpolation::update_ref_points, this,std::placeholders::_1));
         
 
+        // 四类代价权重各有 7 个值，对应机器人 7 个关节。
+        // launch 加载 YAML 时会覆盖这些默认值。
         std::vector<double> default_pos(7, 4.05);
         std::vector<double> default_vel(7, 0.03);
         std::vector<double> default_acc(7, 0.0000125);
@@ -87,7 +109,7 @@ public:
         this->declare_parameter<std::vector<double>>("mpc_weights.acceleration", default_acc);
         this->declare_parameter<std::vector<double>>("mpc_weights.control", default_ctrl);
 
-        // 读取参数
+        // 从 ROS 参数服务器读取 config/mpc_weight.yaml 中的权重。
         pos_weights_ = this->get_parameter("mpc_weights.position").as_double_array();
         vel_weights_ = this->get_parameter("mpc_weights.velocity").as_double_array();
         acc_weights_ = this->get_parameter("mpc_weights.acceleration").as_double_array();
@@ -96,6 +118,7 @@ public:
         MPCsplines_.reserve(jointSize);
         MPCsplines_.clear();
 
+        // 每个关节各创建一个一维 MPC 求解器，七个求解结果再组合成 7 维命令。
         for (size_t i = 0; i < jointSize; ++i) 
         {
             MPCsplines_.emplace_back(
@@ -110,22 +133,27 @@ public:
             << "; vel_w: " << vel_weights_[i] << "; acc_w: " << acc_weights_[i] <<"; ctrl_w: " << ctrl_weights_[i]<<std::endl;
         }
 
+        // 线程 1：50 Hz 生成线性插值参考轨迹。
         exec_plan_thread_ = std::thread(&interpolation::exec_planning,this);
         pthread_t handle_exec = exec_plan_thread_.native_handle();
         setRealtimePriority(handle_exec,85);
         setThreadAffinity(handle_exec,1);
 
+        // 线程 2：1000 Hz 滚动求解 MPC。
         mpc_thread_ = std::thread(&interpolation::mpcTrajCompute, this);
         //  设置 mpc_thread_ 为实时线程 + 绑定 CPU core1
         pthread_t handle_mpc = mpc_thread_.native_handle();
         setRealtimePriority(handle_mpc,85);
         setThreadAffinity(handle_mpc,2);
 
+        // 教学主链路的第三个关键 Topic：rokae_rt_node 订阅 /sent_joints。
         mimic_send_goal_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             "sent_joints", qos);
+        // /sent_cube_ref 仅用于观察未经 MPC 平滑的参考轨迹。
         mimic_send_cuberef_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             "sent_cube_ref", qos);
 
+        // 线程 3：1000 Hz 从结果队列取点并发布。
         mimic_thread_ = std::thread(&interpolation::mimicSendGoal, this);
 
         //  设置 mimic_thread_ 为实时线程 + 绑定 CPU core2
@@ -150,9 +178,12 @@ private:
 
     void update_ref_points(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
     {
+        // 把上游消息的 7 个 float 转成 Eigen 7 维向量。
         Vector7d new_target = conv2EigenVec(msg->data);
         {
             std::lock_guard<std::mutex> lk(target_mtx_);
+            // 一阶低通：新目标占 alpha=0.8，旧滤波值占 0.2，
+            // 用于减小 IK 目标的突变。互斥锁保护多个线程共享的目标。
             if (!filter_initialized_) {
                 filtered_target_ = new_target;
                 filter_initialized_ = true;
@@ -168,6 +199,7 @@ private:
 
     void exec_planning()
     {
+        // 与上游手套/IK 的约 50 Hz 更新节奏一致。
         rclcpp::Rate rate(50);
 
         Vector7d local_end_position;
@@ -200,7 +232,10 @@ private:
             //     }
             // }
 
-            /* ---------------线性插值----------------------*/
+            /* ---------------线性插值----------------------
+             * 在上一个目标 start_position_ 和最新目标 local_end_position 之间，
+             * 均匀生成 IPT_NUM=20 个点并放入 ref_traj_queue_，供 MPC 消费。
+             */
             for (int i = 0; i < IPT_NUM; ++i)
             {
                 double alpha = static_cast<double>(i) / (IPT_NUM - 1);
@@ -226,6 +261,7 @@ private:
             if (!mpc_enabled_.load(std::memory_order_acquire) &&
                 ref_produced_.load(std::memory_order_relaxed) >= MPC_START_REF)
             {
+                // 至少积累 40 个参考点后才允许 MPC 开始。
                 mpc_enabled_.store(true, std::memory_order_release);
             }
 
@@ -238,6 +274,7 @@ private:
 
     void mimicSendGoal()
     {
+        // 高频发布线程：目标周期 1 ms。实际频率仍受系统调度和计算耗时影响。
         rclcpp::Rate rate(1000);
 
         while (rclcpp::ok() && running_)
@@ -260,6 +297,7 @@ private:
                 continue;
             }
 
+            // MPC 结果固定打包为 7 个 float 并发布到 /sent_joints。
             std_msgs::msg::Float32MultiArray msg;
             msg.data.resize(jointSize);
             for (int i = 0; i < jointSize; ++i)
@@ -299,8 +337,9 @@ private:
     }
 
     /**
-     * @brief Computes MPC trajectory using a receding horizon approach.
-     * Waits for sufficient reference points, calls getNextMpcPos, and manages the reference window.
+     * @brief 使用滚动时域方式计算 MPC 轨迹。
+     * 等待足够的参考点，以当前位置/速度/加速度为状态，为 7 个关节分别求解，
+     * 再把下一步 7 维位置送入 mpc_traj_queue_。
      */
     void mpcTrajCompute()
     {
@@ -328,6 +367,7 @@ private:
             Vector7d pt;
             while (ref_window.size() < Horizon && ref_traj_queue_.pop(raw))
             {
+                // 凑齐长度为 Horizon 的预测窗口。
                 ref_window.push_back(raw);
                 cube_traj_.push(raw);
                 ref_consumed_.fetch_add(1, std::memory_order_relaxed);
@@ -340,6 +380,7 @@ private:
                 continue;
             }
 
+            // 把参考窗口整理为“7 个关节 × Horizon 个时刻”的矩阵。
             Matrix7H ref_horizon;
             for (int i = 0; i < Horizon; ++i)
             {
@@ -358,6 +399,7 @@ private:
             
             Matrix7H mpc_out;
             bool mpc_compute_ok = true;
+            // 七个关节逐个求解；代价中同时考虑位置、速度、加速度和控制量。
             for (int j = 0; j < jointSize; ++j)
             {
                 Eigen::Vector3d state0;
@@ -393,6 +435,8 @@ private:
             }
             if (mpc_compute_ok)
             {
+                // N_apply=1：每次只采用本轮预测轨迹的第一个新点，
+                // 下一轮再根据更新后的状态重新优化，这就是“滚动时域”。
                 JointArray mpc_out_arr{};
                 for(int j = 0;j<jointSize;j++)
                 {
@@ -406,6 +450,7 @@ private:
                 if (!mimic_enabled_.load(std::memory_order_acquire) &&
                     mpc_produced_.load(std::memory_order_relaxed) >= MIMIC_START_MPC_NUM)
                 {
+                    // 先缓存 10 个 MPC 结果，再放行 1000 Hz 发布线程。
                     mimic_enabled_.store(true, std::memory_order_release);
                 }
 
@@ -458,16 +503,17 @@ private:
 
     Vector7d conv2EigenVec(const std::vector<float>& lst)
     {
+        // 主链路约定输入长度为 7；上游 arm_tele_real 正常发布 7 个关节角。
         Vector7d out;
         for (size_t i = 0; i < lst.size(); ++i) out(i)= lst[i];
         return out;
     }
 
-    const int IPT_NUM = 20;
+    const int IPT_NUM = 20; // 每组相邻低频目标之间生成的参考点数
     // ===================== 无锁队列 =====================
-    // 上层规划 → MPC
+    // 数据方向：50 Hz 插值线程 → MPC 线程
     boost::lockfree::queue<JointArray, boost::lockfree::capacity<8192>> ref_traj_queue_;
-    // MPC → 发送线程
+    // 数据方向：MPC 线程 → 1000 Hz 发布线程
     boost::lockfree::queue<JointArray, boost::lockfree::capacity<4096>> mpc_traj_queue_;
     // boost::lockfree::queue<JointArray,boost::lockfree::capacity<MPC_BUFFER_CAP>> mpc_buffer_queue_;
 
@@ -506,9 +552,9 @@ private:
     std::atomic<uint32_t> mpc_produced_{0};    // MPC 已产生的点数
     std::atomic<bool> mimic_enabled_{false};  // mimic 启动闸门
 
-    const unsigned int N_apply = 1;
+    const unsigned int N_apply = 1; // 每轮 MPC 只执行预测序列中的 1 步
 
-    // filter
+    // /rokae_control_joints 目标的一阶低通滤波状态
     Vector7d filtered_target_ = Vector7d::Zero();
     bool filter_initialized_ = false;
     const double target_alpha_ = 0.8;

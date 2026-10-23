@@ -17,12 +17,29 @@
 using namespace std::chrono_literals;
 using namespace rokae;
 
+/*
+ * Rokae 真机实时控制节点
+ * =====================
+ *
+ * 教学主链路的最后一段：
+ *   /sent_joints（MPC 输出的 7 个高频关节命令）
+ *       -> jointPositionCallback()：校验并放入有限队列
+ *       -> rokae_callback()：实时循环逐条取出
+ *       -> Rokae 实时控制 SDK
+ *       -> xMateEr Pro 物理机械臂
+ *
+ * 安全边界：
+ *   本文件会连接、切换模式、上电并实际移动机械臂。启动节点本身就会在
+ *   构造函数中执行一次 MoveJ 到 zero_pos；按下 'c' 只是之后再启动实时
+ *   关节位置跟随，不能把“尚未按 c”理解为“机器人绝对不会运动”。
+ */
+
 class rt_RobotCtrlNode :  public rclcpp::Node
 {
 public:
     rt_RobotCtrlNode() : Node("rt_robot_control_node")
     {
-        // 初始化rokae机器人
+        // 连接真机：robot_ip 是机械臂控制器地址，local_ip 是本机控制网卡地址。
         std::error_code ec;
         try
         {
@@ -36,13 +53,14 @@ public:
             rclcpp::shutdown();
             return;
         }
+        // 进入自动/实时命令模式并上电。这些调用已经改变物理设备状态。
         robot_.setOperateMode(OperateMode::automatic, ec);
         robot_.setRtNetworkTolerance(20, ec);
         // robot_.setMotionControlMode(MotionControlMode::NrtCommand, ec);
         robot_.setMotionControlMode(MotionControlMode::RtCommand, ec);
         robot_.setPowerState(true,ec);
 
-        //订阅节点
+        // 订阅 MPC 的 /sent_joints。只保留最新一条，并使用可靠、易失 QoS。
         auto qos = rclcpp::QoS(rclcpp::KeepLast(1))
         .reliability(rclcpp::ReliabilityPolicy::Reliable)
         .durability(rclcpp::DurabilityPolicy::Volatile)
@@ -53,7 +71,11 @@ public:
             std::bind(&rt_RobotCtrlNode::jointPositionCallback, this, std::placeholders::_1)
         );
 
-        // 初始化关节位置
+        /*
+         * 启动阶段的物理动作：
+         * 获取实时控制器、以 1 ms 周期接收机器人状态，然后调用 MoveJ 回零。
+         * 这段代码发生在构造函数里，早于键盘线程，也不需要先按 'c'。
+         */
         try
         {
             RCLCPP_INFO(this->get_logger(), "Initializing robot joint positions to zero.");
@@ -96,6 +118,7 @@ public:
             // }
             // std::cout << "Robot power state: " << state_str << std::endl;
             
+            // 从当前关节位置运动到 7 轴全零位；这是实际真机运动指令。
             motion_controller_->MoveJ(0.5,robot_.jointPos(ec),zero_pos);
             RCLCPP_INFO(this->get_logger(), "Robot joint positions initialized to zero.");
 
@@ -117,6 +140,7 @@ public:
 
 
 
+        // 键盘线程用于启动控制模式或退出，避免阻塞 ROS 2 订阅回调。
         keyboard_thread_ = std::thread([this]()
         {
             this->keyboard_input_thread();
@@ -125,6 +149,7 @@ public:
 
     ~rt_RobotCtrlNode()
     {
+        // 节点退出时停止实时循环，随后下电并退回 Idle 模式。
         if(control_thread_.joinable())
         {
             motion_controller_->stopLoop();
@@ -142,6 +167,7 @@ private:
 
     void jointPositionCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
     {
+        // 驱动只接受恰好 7 个元素的消息；其他长度不会进入控制队列。
         if(msg->data.size() == 7)
         {
             std::array<double, 7> new_positions;
@@ -151,6 +177,7 @@ private:
             }
             {
                 std::lock_guard<std::mutex> lock(joint_positions_mutex_);
+                // 队列达到上限时丢弃最旧命令，避免延迟无限累积。
                 if(joint_queue_.size() >= max_queue_size_) {
                     joint_queue_.pop_front();
                 }
@@ -158,7 +185,7 @@ private:
             }
         }
 
-        //debug:检测消息间隔
+        // 调试：/sent_joints 设计周期约 1 ms，间隔超过 1.5 ms 时报警。
         static rclcpp::Time last_msg_time = this->get_clock()->now();
         rclcpp::Time current_msg_time = this->get_clock()->now();
         double interval_ms = (current_msg_time - last_msg_time).seconds() * 1000.0;
@@ -173,6 +200,7 @@ private:
 
     JointPosition rokae_callback()
     {
+        // 此函数由 Rokae SDK 的实时控制循环反复调用，每次必须返回一个目标。
         std::error_code ec;
         bool is_ready_to_move = false;
         bool has_new_command = false;
@@ -181,6 +209,7 @@ private:
             std::lock_guard<std::mutex> lock(joint_positions_mutex_);
             if(!joint_queue_.empty()) 
             {
+                // 有新命令：按先进先出顺序取出，并记为最近一次有效命令。
                 current_target_joint_pos_ = joint_queue_.front();
                 joint_queue_.pop_front();
                 last_valid_command_ = current_target_joint_pos_;
@@ -197,14 +226,17 @@ private:
         // std::cout << init_joint_pos_set_<< std::endl;
         if(is_ready_to_move && has_new_command)
         {
+            // 初始化动作已完成且队列有数据：执行新目标。
             cmd.joints = std::vector<double>(current_target_joint_pos_.begin(), current_target_joint_pos_.end());
         }
         else if(is_ready_to_move &&  !has_new_command)
         {
+            // 暂时断流：保持最近一次有效目标，而不是生成随机或空命令。
             cmd.joints = std::vector<double>(last_valid_command_.begin(), last_valid_command_.end());
         }
         else
         {
+            // 实时跟随尚未就绪：命令当前位置，使机械臂保持不动。
             std::array<double,7> cur_jntPos = robot_.jointPos(ec);
             cmd.joints = std::vector<double>(cur_jntPos.begin(),cur_jntPos.end());
         }
@@ -219,6 +251,7 @@ private:
 
     int kbhit(void)
     {
+        // 非阻塞检测终端按键，并在检查后恢复终端属性。
         struct termios oldt, newt;
         int ch;
         int oldf;
@@ -249,12 +282,15 @@ private:
                 switch (ch)
                 {
                     case 'c':
+                        // c：启动关节位置实时跟随。
                         followed_loop(RtControllerMode::jointPosition);
                         break;
                     case 'v':
+                        // v：启动关节阻抗实时跟随。
                         followed_loop(RtControllerMode::jointImpedance);
                         break;
                     case 'q':
+                        // q：请求 ROS 2 关闭；析构函数随后停止循环并下电。
                         std::cout << "Exiting..." << std::endl;
                         rclcpp::shutdown();  
                         return;
@@ -268,6 +304,7 @@ private:
 
     void followed_loop(RtControllerMode followed_mode)
     {
+        // 只允许启动一次，避免重复创建 SDK 控制循环和控制线程。
         if (!control_loop_started_) 
         {
             std::error_code ec;
@@ -291,6 +328,8 @@ private:
                 return;
             }
 
+            // 启动实时循环前，先 MoveJ 到队列最新目标（无消息时为零位），
+            // 让实际起点与即将执行的命令尽量衔接；这也是一次物理运动。
             motion_controller_->MoveJ(0.5,robot_.jointPos(ec),target_pos);
             // size_t size_q = 0;
             // {
@@ -322,12 +361,14 @@ private:
                 init_move_completed = true;
             }
 
+            // 注册实时回调：SDK 每个控制周期通过 rokae_callback() 取得目标。
             motion_controller_->setControlLoop(
                 std::function<JointPosition()>(std::bind(&rt_RobotCtrlNode::rokae_callback, this)),
                 0,
                 true
             );
             RCLCPP_INFO(this->get_logger(), "Control loop started.");
+            // startLoop() 是阻塞式实时循环，因此在独立线程中运行。
             control_thread_ = std::thread([this]() 
             {
                 try 
@@ -344,6 +385,7 @@ private:
     }
 
 
+    // -------------------- 硬件接口与 ROS 通信 --------------------
     rokae::xMateErProRobot robot_;
 
     std::shared_ptr<RtMotionControlCobot<7>> motion_controller_;
@@ -356,12 +398,13 @@ private:
 
     const std::array<double, 7> torqueThresholds = { 75, 75, 60, 45, 30, 30, 20 };
     std::array<double, 7> last_valid_command_ = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    //线程共享数据
+    // ROS 订阅线程与 SDK 实时线程共享命令队列，访问时必须加锁。
     std::mutex joint_positions_mutex_;
     std::deque<std::array<double,7>> joint_queue_;
     const size_t max_queue_size_ = 100; // 定长队列大小
 
 
+    // 三个状态分别表示：可从队列取目标、启动前 MoveJ 已完成、实时循环已启动。
     bool init_joint_pos_set_ = false;
     bool init_move_completed = false;
     bool control_loop_started_ = false;
@@ -376,6 +419,7 @@ private:
 
 int main(int argc, char **argv)
 {
+    // 创建节点就会连接、上电并回零；spin() 负责接收 /sent_joints。
     rclcpp::init(argc, argv);
     auto node = std::make_shared<rt_RobotCtrlNode>();
     rclcpp::spin(node);
