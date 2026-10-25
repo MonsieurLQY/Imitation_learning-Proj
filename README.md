@@ -1,2 +1,2 @@
 # Imitation_learning-Proj
-韩学长的毕业设计。
+某位前辈学长的毕业设计。
